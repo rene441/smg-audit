@@ -1,0 +1,41 @@
+{
+  "name": "@rene__25/smg-accessibility-audit",
+  "version": "0.2.1",
+  "description": "Standalone accessibility audit and repair CLI extracted from SMG Shopify standards tooling.",
+  "type": "commonjs",
+  "bin": {
+    "smg-accessibility-audit": "./tools/accessibility-cli/accessibility-audit-playwright.cjs",
+    "smg-accessibility-audit-and-repair": "./scripts/audit-and-repair.cjs",
+    "smg-accessibility-report": "./scripts/read-accessibility-report.cjs",
+    "smg-accessibility-repair": "./scripts/repair-accessibility-from-report.cjs"
+  },
+  "scripts": {
+    "accessibility-audit": "node tools/accessibility-cli/accessibility-audit-playwright.cjs",
+    "accessibility-audit-and-repair": "node scripts/audit-and-repair.cjs",
+    "accessibility-audit-complete": "node tools/accessibility-cli/accessibility-audit-playwright.cjs --mode full",
+    "accessibility-audit-complete-html": "node tools/accessibility-cli/accessibility-audit-playwright.cjs --mode full --html",
+    "accessibility-report-read": "node scripts/read-accessibility-report.cjs",
+    "accessibility-repair": "node scripts/repair-accessibility-from-report.cjs"
+  },
+  "keywords": [
+    "accessibility",
+    "axe",
+    "playwright",
+    "shopify",
+    "smg"
+  ],
+  "author": "Solo Media Group",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@axe-core/playwright": "^4.11.0",
+    "axe-html-reporter": "^2.2.11",
+    "playwright": "^1.59.1",
+    "yargs": "^18.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

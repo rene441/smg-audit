@@ -1,0 +1,7 @@
+node_modules/
+*.log
+tools/accessibility-cli/accesibilidad_report.txt
+tools/accessibility-cli/color-contrast-report.txt
+tools/accessibility-cli/accessibility-contrast-slides.html
+tools/accessibility-cli/.wave-profile/
+.smg-accessibility-audit/
