@@ -1,13 +1,13 @@
 {
-  "name": "@rene__25/smg-accessibility-audit",
-  "version": "0.2.1",
+  "name": "smg-accessibility-audit",
+  "version": "0.2.8",
   "description": "Standalone accessibility audit and repair CLI extracted from SMG Shopify standards tooling.",
   "type": "commonjs",
   "bin": {
-    "smg-accessibility-audit": "./tools/accessibility-cli/accessibility-audit-playwright.cjs",
-    "smg-accessibility-audit-and-repair": "./scripts/audit-and-repair.cjs",
-    "smg-accessibility-report": "./scripts/read-accessibility-report.cjs",
-    "smg-accessibility-repair": "./scripts/repair-accessibility-from-report.cjs"
+    "smg-accessibility-audit": "tools/accessibility-cli/accessibility-audit-playwright.cjs",
+    "smg-accessibility-audit-and-repair": "scripts/audit-and-repair.cjs",
+    "smg-accessibility-report": "scripts/read-accessibility-report.cjs",
+    "smg-accessibility-repair": "scripts/repair-accessibility-from-report.cjs"
   },
   "scripts": {
     "accessibility-audit": "node tools/accessibility-cli/accessibility-audit-playwright.cjs",
@@ -26,9 +26,6 @@
   ],
   "author": "Solo Media Group",
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
   "dependencies": {
     "@axe-core/playwright": "^4.11.0",
     "axe-html-reporter": "^2.2.11",

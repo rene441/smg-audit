@@ -8,6 +8,7 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const { createHtmlReport } = require('axe-html-reporter');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 
@@ -124,7 +125,6 @@ const argv = yargs(hideBin(process.argv))
   .option('url', {
     alias: 'u',
     describe: 'URL a auditar',
-    demandOption: true,
     type: 'string',
   })
   .option('html', {
@@ -224,6 +224,34 @@ const argv = yargs(hideBin(process.argv))
     type: 'number',
     default: DEFAULT_SCENARIO_TIMEOUT_MS,
   })
+  .option('site', {
+    describe: 'Audita todas las paginas del sitio descubiertas desde la URL inicial, preguntando antes de cada una (y/n/a)',
+    type: 'boolean',
+    default: false,
+  })
+  .option('asana', {
+    describe: 'Crea tickets en Asana al finalizar: tarea padre + subtarea por pagina auditada',
+    type: 'boolean',
+    default: false,
+  })
+  .option('asana-token', {
+    describe: 'Personal Access Token de Asana (o variables ASANA_TOKEN / ASANA_PAT)',
+    type: 'string',
+  })
+  .option('asana-project-gid', {
+    describe: 'GID del proyecto Asana destino (si no se detecta automaticamente por dominio)',
+    type: 'string',
+  })
+  .option('save-asana-token', {
+    describe: 'Guarda el token de Asana en ~/.config/smg/asana.env para no tener que pasarlo cada vez',
+    type: 'string',
+  })
+  .check((argv) => {
+    if (!argv.saveAsanaToken && !argv.url) {
+      throw new Error('--url es requerida (o usa --save-asana-token TOKEN para guardar el token)');
+    }
+    return true;
+  })
   .help()
   .argv;
 
@@ -249,7 +277,112 @@ const INTERACTION_DISCOVERY_LIMIT = Math.max(MAX_INTERACTIVE_SCENARIOS, argv.int
 const PREPARE_PAGE_DELAY_MS = Math.max(0, argv.preparePageDelayMs);
 const INTERACTION_SETTLE_DELAY = Math.max(0, argv.interactionSettleDelayMs);
 const SCENARIO_TIMEOUT_MS = Math.max(1000, argv.scenarioTimeoutMs);
+const SITE_MODE = Boolean(argv.site);
+const ASANA_MODE = Boolean(argv.asana);
+const ASANA_TOKEN = argv.asanaToken || process.env.ASANA_TOKEN || process.env.ASANA_PAT || loadAsanaTokenFromConfigFile();
+const ASANA_FORCED_PROJECT_GID = argv.asanaProjectGid || '';
+const ASANA_WORKSPACE_GID = '337970440385505';
+const ASANA_API_BASE = 'https://app.asana.com/api/1.0';
 let cachedInstalledWaveProfile;
+
+function getHomeDir() {
+  return process.env.HOME || process.env.USERPROFILE || '';
+}
+
+function getAsanaConfigPath() {
+  return path.join(getHomeDir(), '.config', 'smg', 'asana.env');
+}
+
+function loadAsanaTokenFromConfigFile() {
+  const configPath = getAsanaConfigPath();
+
+  if (!fs.existsSync(configPath)) {
+    return '';
+  }
+
+  const content = fs.readFileSync(configPath, 'utf8');
+  const match = content.match(/^ASANA_(?:PAT|TOKEN)=(.+)$/m);
+  return match ? match[1].trim() : '';
+}
+
+function saveAsanaToken(token) {
+  const configDir = path.dirname(getAsanaConfigPath());
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(getAsanaConfigPath(), `ASANA_PAT=${token}\n`, 'utf8');
+  console.log(`Token guardado en ${getAsanaConfigPath()}`);
+  console.log('A partir de ahora puedes usar --asana sin pasar el token.');
+}
+
+if (argv.saveAsanaToken) {
+  saveAsanaToken(argv.saveAsanaToken);
+  process.exit(0);
+}
+
+function promptUser(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase());
+    });
+  });
+}
+
+function slugifyUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const slug = (parsed.pathname + parsed.search)
+      .replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80);
+
+    return slug || 'home';
+  } catch {
+    return 'page';
+  }
+}
+
+async function discoverSiteUrls(url) {
+  const browser = await chromium.launch({ headless: HEADLESS });
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await context.newPage();
+    await navigateWithFallback(page, url);
+    const baseOrigin = new URL(url).origin;
+    const discovered = await page.evaluate((origin) => {
+      return Array.from(document.querySelectorAll('a[href]'))
+        .map((anchor) => {
+          try {
+            const href = new URL(anchor.href, window.location.href).href;
+            return href.split('#')[0].replace(/\/$/, '') || null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((href) => {
+          if (!href) {
+            return false;
+          }
+
+          try {
+            return new URL(href).origin === origin;
+          } catch {
+            return false;
+          }
+        });
+    }, baseOrigin);
+    const normalizedCurrent = url.split('#')[0].replace(/\/$/, '');
+
+    return [...new Set(discovered)].filter((link) => link !== normalizedCurrent);
+  } finally {
+    await browser.close();
+  }
+}
 
 function ensureOutputDirIsIgnored() {
   const defaultOutputDir = path.resolve(process.cwd(), '.smg-accessibility-audit');
@@ -3452,7 +3585,8 @@ function resolveAuditStatus(unifiedFindings, coverage, wave) {
   };
 }
 
-function printReport(url, axeJson) {
+function printReport(url, axeJson, outDir) {
+  outDir = outDir || OUTPUT_DIR;
   const violations = sortViolations(axeJson.violations || []);
   const coverage = axeJson.coverage || {};
   const pageVisibility = axeJson.pageVisibility || null;
@@ -3517,16 +3651,16 @@ function printReport(url, axeJson) {
       process.stdout.write = originalStdoutWrite;
     }
 
-    const reportPath = path.join(OUTPUT_DIR, reportFileName);
+    const reportPath = path.join(outDir, reportFileName);
     if (typeof reportHtml === 'string' && reportHtml.length > 0) {
       fs.writeFileSync(reportPath, reportHtml, 'utf8');
     }
   }
 
-  const txtPath = path.join(OUTPUT_DIR, 'accesibilidad_report.txt');
+  const txtPath = path.join(outDir, 'accesibilidad_report.txt');
   fs.writeFileSync(txtPath, details, 'utf8');
 
-  const contrastSlidesPath = path.join(OUTPUT_DIR, CONTRAST_SLIDES_FILE_NAME);
+  const contrastSlidesPath = path.join(outDir, CONTRAST_SLIDES_FILE_NAME);
   fs.writeFileSync(contrastSlidesPath, buildContrastSlidesHtml(url, axeJson, unifiedFindings), 'utf8');
 }
 
@@ -3571,12 +3705,461 @@ function printTerminalSummary(url, axeJson) {
   }
 }
 
+async function asanaRequest(method, endpoint, body, token) {
+  const response = await fetchWithTimeout(`${ASANA_API_BASE}${endpoint}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    ...(body ? { body: JSON.stringify({ data: body }) } : {}),
+  }, 30000);
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Asana API ${response.status}: ${errorText}`);
+  }
+
+  return response.json();
+}
+
+function extractDomainSlug(url) {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    return hostname
+      .replace(/\.myshopify\.com$/, '')
+      .replace(/\.(com|co|net|org|io|shop|store)$/, '')
+      .toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function scoreProjectMatch(projectName, domainSlug) {
+  const normName = projectName.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const normSlug = domainSlug.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+  if (normName === normSlug) {
+    return 100;
+  }
+
+  if (normName.includes(normSlug) || normSlug.includes(normName)) {
+    return 80;
+  }
+
+  const nameWords = normName.split(' ').filter((w) => w.length > 2);
+  const slugWords = normSlug.split(' ').filter((w) => w.length > 2);
+  const overlap = nameWords.filter((w) => slugWords.some((sw) => sw.includes(w) || w.includes(sw)));
+
+  return overlap.length > 0
+    ? Math.round((overlap.length / Math.max(nameWords.length, slugWords.length)) * 60)
+    : 0;
+}
+
+async function findAsanaProject(url, token, forcedGid) {
+  if (forcedGid) {
+    const result = await asanaRequest('GET', `/projects/${forcedGid}?opt_fields=gid,name`, null, token);
+    return [{ ...result.data, score: 100 }];
+  }
+
+  const domainSlug = extractDomainSlug(url);
+
+  if (!domainSlug) {
+    return [];
+  }
+
+  const projects = [];
+  let offset = '';
+
+  while (true) {
+    const qs = offset
+      ? `limit=100&opt_fields=gid,name&offset=${encodeURIComponent(offset)}`
+      : 'limit=100&opt_fields=gid,name';
+    const result = await asanaRequest('GET', `/workspaces/${ASANA_WORKSPACE_GID}/projects?${qs}`, null, token);
+    projects.push(...(result.data || []));
+
+    if (result.next_page && result.next_page.offset) {
+      offset = result.next_page.offset;
+    } else {
+      break;
+    }
+  }
+
+  return projects
+    .map((project) => ({ ...project, score: scoreProjectMatch(project.name, domainSlug) }))
+    .filter((p) => p.score > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+function buildPageSummaryHtmlNotes(url, axeJson) {
+  const violations = sortViolations(axeJson.violations || []);
+  const wave = axeJson.wave || null;
+  const coverage = axeJson.coverage || {};
+  const unifiedFindings = collectUnifiedFindings(violations, wave);
+  const autofixFindings = unifiedFindings.filter((f) => f.correctionType === 'autofix');
+  const manualFindings = unifiedFindings.filter((f) => f.correctionType !== 'autofix');
+  const auditStatus = resolveAuditStatus(unifiedFindings, coverage, wave);
+  const totalNodes = unifiedFindings.reduce((acc, f) => acc + f.count, 0);
+  const statusEmoji = auditStatus.label === 'APROBADO' ? '&#x2705;' : auditStatus.label === 'INCONCLUSO' ? '&#x26A0;&#xFE0F;' : '&#x274C;';
+
+  let html = '<body>';
+  html += `<strong>URL:</strong> ${escapeHtml(url)}\n`;
+  html += `<strong>Estado:</strong> ${statusEmoji} ${escapeHtml(auditStatus.label)}\n`;
+  html += `<strong>Elementos afectados:</strong> ${totalNodes}\n`;
+
+  if (coverage.scenarios && coverage.scenarios.length > 0) {
+    html += `<strong>Escenarios ejecutados:</strong> ${coverage.scenarios.length}\n`;
+  }
+
+  html += '\n';
+
+  if (autofixFindings.length > 0) {
+    html += '<strong>Autofix disponible:</strong>\n<ul>';
+    for (const finding of autofixFindings) {
+      html += `<li><code>${escapeHtml(finding.ruleId)}</code> &#x2014; ${finding.count} elemento(s)</li>`;
+    }
+    html += '</ul>';
+  }
+
+  if (manualFindings.length > 0) {
+    html += '<strong>Correccion manual requerida:</strong>\n<ul>';
+    for (const finding of manualFindings) {
+      html += `<li><code>${escapeHtml(finding.ruleId)}</code> &#x2014; ${finding.count} elemento(s)</li>`;
+    }
+    html += '</ul>';
+  }
+
+  if (unifiedFindings.length === 0) {
+    html += '<strong>No se encontraron errores de accesibilidad.</strong>\n';
+  }
+
+  html += '</body>';
+  return html;
+}
+
+function buildRuleFindingHtmlNotes(url, finding) {
+  let html = '<body>';
+  html += `<strong>Regla:</strong> <code>${escapeHtml(finding.ruleId)}</code>\n`;
+  html += `<strong>URL:</strong> ${escapeHtml(url)}\n`;
+  html += `<strong>Correccion:</strong> ${escapeHtml(getFixStrategyLabel(finding.ruleId))}\n`;
+  html += `<strong>Elementos afectados:</strong> ${finding.count}\n`;
+  html += `<strong>Resumen:</strong> ${escapeHtml(finding.summaryLabel)}\n`;
+  html += '\n<strong>Elementos con error:</strong>\n<ul>';
+
+  for (const sample of finding.samples) {
+    if (sample.kind === 'axe' && sample.node) {
+      const { node } = sample;
+      const metadata = node.metadata || {};
+      const { ratio, min } = extractContrastDetails(node);
+
+      html += '<li>';
+      if (metadata.tagName) {
+        html += `<code>${escapeHtml(metadata.tagName)}</code> `;
+      }
+      if (metadata.className && metadata.className !== '(sin clase)') {
+        html += `<em>${escapeHtml(shortenText(metadata.className, 60))}</em> `;
+      }
+      if (metadata.nearestParent) {
+        html += `&#x2014; ${escapeHtml(metadata.nearestParent)}`;
+      }
+      if (node.html) {
+        html += `\n<code>${escapeHtml(shortenText(node.html.replace(/\s+/g, ' ').trim(), 160))}</code>`;
+      }
+      if (finding.ruleId === 'color-contrast' && ratio !== 'No disponible') {
+        html += `\nContraste: ${escapeHtml(String(ratio))} &#x2014; minimo requerido: ${escapeHtml(String(min))}`;
+      }
+      html += '</li>';
+    } else if (sample.kind === 'wave-node' && sample.node) {
+      const { node } = sample;
+      const metadata = node.metadata || {};
+
+      html += '<li>';
+      if (metadata.tagName) {
+        html += `<code>${escapeHtml(metadata.tagName)}</code> `;
+      }
+      if (node.textSnippet) {
+        html += `"${escapeHtml(shortenText(node.textSnippet, 100))}"`;
+      }
+      if (node.html) {
+        html += `\n<code>${escapeHtml(shortenText(node.html, 160))}</code>`;
+      }
+      html += '</li>';
+    } else if (sample.label) {
+      html += `<li>${escapeHtml(sample.label)}</li>`;
+    }
+  }
+
+  html += '</ul></body>';
+  return html;
+}
+
+async function createRuleSubtasks(pageTaskGid, url, axeJson, outDir, token) {
+  const violations = sortViolations(axeJson.violations || []);
+  const wave = axeJson.wave || null;
+  const unifiedFindings = collectUnifiedFindings(violations, wave);
+
+  for (const finding of unifiedFindings) {
+    const fixEmoji = finding.correctionType === 'autofix' ? '&#x1F527;' : '&#x270B;';
+
+    try {
+      const result = await asanaRequest('POST', `/tasks/${pageTaskGid}/subtasks`, {
+        name: `${finding.correctionType === 'autofix' ? '🔧' : '✋'} ${finding.ruleId} — ${finding.count} elemento(s)`,
+        html_notes: buildRuleFindingHtmlNotes(url, finding),
+      }, token);
+
+    } catch (err) {
+      console.warn(`[ASANA]   Error en subtarea ${finding.ruleId}: ${err.message}`);
+    }
+  }
+}
+
+async function uploadFileToAsanaTask(taskGid, filePath, token) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const fileContent = fs.readFileSync(filePath);
+  const fileName = path.basename(filePath);
+  const boundary = `----FormBoundary${Date.now()}`;
+  const CRLF = '\r\n';
+
+  const preamble = Buffer.from([
+    `--${boundary}`,
+    'Content-Disposition: form-data; name="parent"',
+    '',
+    taskGid,
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="file"; filename="${fileName}"`,
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '',
+  ].join(CRLF));
+
+  const epilogue = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+  const body = Buffer.concat([preamble, fileContent, epilogue]);
+
+  const response = await fetchWithTimeout(`${ASANA_API_BASE}/attachments`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  }, 60000);
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Asana attachment HTTP ${response.status}: ${errText}`);
+  }
+
+  return response.json();
+}
+
+async function createAsanaSiteAuditTasks(auditUrl, siteResults, token) {
+  console.log('\n[ASANA] Buscando proyecto...');
+
+  let candidates;
+
+  try {
+    candidates = await findAsanaProject(auditUrl, token, ASANA_FORCED_PROJECT_GID);
+  } catch (err) {
+    console.error(`[ASANA] Error al buscar proyecto: ${err.message}`);
+    return;
+  }
+
+  if (!candidates || candidates.length === 0) {
+    console.log('[ASANA] No se encontro un proyecto que coincida con el dominio.');
+    console.log('[ASANA] Usa --asana-project-gid para especificarlo manualmente.');
+    return;
+  }
+
+  const selectedProject = candidates[0];
+
+  console.log(`[ASANA] Proyecto seleccionado: "${selectedProject.name}" (coincidencia ${selectedProject.score}%)`);
+
+  const domain = new URL(auditUrl).hostname;
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const isSiteMode = siteResults.length > 1;
+
+  const firstResult = siteResults[0];
+  const firstPath = (() => { try { return new URL(firstResult.url).pathname || '/'; } catch { return firstResult.url; } })();
+  const firstViolations = sortViolations(firstResult.axeJson.violations || []);
+  const firstFindings = collectUnifiedFindings(firstViolations, firstResult.axeJson.wave || null);
+  const firstStatus = resolveAuditStatus(firstFindings, firstResult.axeJson.coverage || {}, firstResult.axeJson.wave || null);
+  const firstTotalNodes = firstFindings.reduce((acc, f) => acc + f.count, 0);
+
+  const parentName = isSiteMode
+    ? `[ADA Audit] ${domain} — ${dateStr}`
+    : `[ADA Audit] ${domain} — ${dateStr} - ${firstPath} — ${firstStatus.label} (${firstTotalNodes} elementos)`;
+
+  const pagesWithErrors = siteResults.filter(({ axeJson }) => {
+    const findings = collectUnifiedFindings(sortViolations(axeJson.violations || []), axeJson.wave || null);
+    return findings.length > 0;
+  }).length;
+
+  const parentHtmlNotes = isSiteMode
+    ? `<body><strong>Auditoria de accesibilidad WCAG 2.2 AA</strong>\n<strong>Sitio:</strong> ${escapeHtml(auditUrl)}\n<strong>Paginas auditadas:</strong> ${siteResults.length}\n<strong>Paginas con errores:</strong> ${pagesWithErrors}\n<strong>Fecha:</strong> ${escapeHtml(dateStr)}\n</body>`
+    : buildPageSummaryHtmlNotes(firstResult.url, firstResult.axeJson);
+
+  console.log(`[ASANA] Creando tarea principal en "${selectedProject.name}"...`);
+
+  let parentGid;
+
+  try {
+    const parentResult = await asanaRequest('POST', '/tasks', {
+      name: parentName,
+      projects: [selectedProject.gid],
+      html_notes: parentHtmlNotes,
+    }, token);
+    parentGid = parentResult.data.gid;
+  } catch (err) {
+    console.error(`[ASANA] Error al crear tarea principal: ${err.message}`);
+    return;
+  }
+
+  console.log(`[ASANA] Tarea principal: https://app.asana.com/0/${selectedProject.gid}/${parentGid}`);
+
+  if (isSiteMode) {
+    for (const { url, axeJson, outDir } of siteResults) {
+      const urlPath = (() => { try { return new URL(url).pathname || '/'; } catch { return url; } })();
+      const violations = sortViolations(axeJson.violations || []);
+      const wave = axeJson.wave || null;
+      const unifiedFindings = collectUnifiedFindings(violations, wave);
+      const coverage = axeJson.coverage || {};
+      const auditStatus = resolveAuditStatus(unifiedFindings, coverage, wave);
+      const totalNodes = unifiedFindings.reduce((acc, f) => acc + f.count, 0);
+
+      console.log(`[ASANA] Subtarea pagina: ${urlPath}...`);
+
+      let pageTaskGid;
+
+      try {
+        const pageResult = await asanaRequest('POST', `/tasks/${parentGid}/subtasks`, {
+          name: `${urlPath} — ${auditStatus.label} (${totalNodes} elementos)`,
+          html_notes: buildPageSummaryHtmlNotes(url, axeJson),
+        }, token);
+        pageTaskGid = pageResult.data.gid;
+      } catch (err) {
+        console.warn(`[ASANA]   Error al crear subtarea ${urlPath}: ${err.message}`);
+        continue;
+      }
+
+      if (outDir) {
+        const slidesPath = path.join(outDir, CONTRAST_SLIDES_FILE_NAME);
+        if (fs.existsSync(slidesPath) && fs.statSync(slidesPath).size > 500) {
+          try {
+            await uploadFileToAsanaTask(pageTaskGid, slidesPath, token);
+            console.log(`[ASANA]   Slides de contraste adjuntados.`);
+          } catch (attachErr) {
+            console.warn(`[ASANA]   No se pudo adjuntar slides: ${attachErr.message}`);
+          }
+        }
+      }
+
+      if (unifiedFindings.length > 0) {
+        console.log(`[ASANA]   Creando sub-subtareas por regla...`);
+        await createRuleSubtasks(pageTaskGid, url, axeJson, outDir, token);
+      }
+    }
+  } else {
+    console.log(`[ASANA] Creando subtareas por regla...`);
+    await createRuleSubtasks(parentGid, firstResult.url, firstResult.axeJson, firstResult.outDir, token);
+
+    if (firstResult.outDir) {
+      const slidesPath = path.join(firstResult.outDir, CONTRAST_SLIDES_FILE_NAME);
+      if (fs.existsSync(slidesPath) && fs.statSync(slidesPath).size > 500) {
+        try {
+          await uploadFileToAsanaTask(parentGid, slidesPath, token);
+          console.log(`[ASANA] Slides de contraste adjuntados a la tarea principal.`);
+        } catch (attachErr) {
+          console.warn(`[ASANA] No se pudo adjuntar slides: ${attachErr.message}`);
+        }
+      }
+    }
+  }
+
+  console.log(`\n[ASANA] Tickets creados: https://app.asana.com/0/${selectedProject.gid}/${parentGid}`);
+}
+
 (async () => {
   try {
     const axeJson = await runAudit(AUDIT_URL);
     printReport(AUDIT_URL, axeJson);
     printTerminalSummary(AUDIT_URL, axeJson);
     logAuditProgress(100, 'Auditoria completada');
+
+    const siteResults = [{ url: AUDIT_URL, axeJson, outDir: OUTPUT_DIR }];
+
+    if (!SITE_MODE) {
+      if (ASANA_MODE) {
+        if (!ASANA_TOKEN) {
+          console.error('[ASANA] Falta el token. Usa --asana-token o la variable ASANA_TOKEN / ASANA_PAT.');
+        } else {
+          await createAsanaSiteAuditTasks(AUDIT_URL, siteResults, ASANA_TOKEN);
+        }
+      }
+
+      return;
+    }
+
+    console.log('\n[SITE] Descubriendo paginas del sitio...');
+    const siteUrls = await discoverSiteUrls(AUDIT_URL);
+    console.log(`[SITE] ${siteUrls.length} pagina(s) descubierta(s).`);
+
+    if (siteUrls.length === 0) {
+      console.log('[SITE] No se encontraron paginas adicionales para auditar.');
+    }
+
+    let autoMode = false;
+
+    for (let i = 0; i < siteUrls.length; i++) {
+      const pageUrl = siteUrls[i];
+      let shouldAudit = autoMode;
+
+      if (!autoMode) {
+        const answer = await promptUser(
+          `\n[SITE] (${i + 1}/${siteUrls.length}) ${pageUrl}\n  [y] Auditar  [n] Omitir  [a] Auditar todas las siguientes automaticamente\n  > `,
+        );
+
+        if (answer === 'a') {
+          autoMode = true;
+          shouldAudit = true;
+        } else if (answer === 'y') {
+          shouldAudit = true;
+        } else {
+          console.log('[SITE] Pagina omitida.');
+          continue;
+        }
+      }
+
+      if (shouldAudit) {
+        console.log(`\n[SITE] Auditando: ${pageUrl}`);
+
+        try {
+          const pageSlug = slugifyUrl(pageUrl);
+          const pageOutDir = path.join(OUTPUT_DIR, pageSlug);
+          fs.mkdirSync(pageOutDir, { recursive: true });
+          const pageAxeJson = await runAudit(pageUrl);
+          printReport(pageUrl, pageAxeJson, pageOutDir);
+          printTerminalSummary(pageUrl, pageAxeJson);
+          logAuditProgress(100, `Pagina auditada: ${pageUrl}`);
+          siteResults.push({ url: pageUrl, axeJson: pageAxeJson, outDir: pageOutDir });
+        } catch (pageErr) {
+          console.error(`[SITE] Error auditando ${pageUrl}: ${pageErr.message}`);
+        }
+      }
+    }
+
+    console.log('\n[SITE] Auditoria del sitio completada.');
+
+    if (ASANA_MODE) {
+      if (!ASANA_TOKEN) {
+        console.error('[ASANA] Falta el token. Usa --asana-token o la variable ASANA_TOKEN / ASANA_PAT.');
+      } else {
+        await createAsanaSiteAuditTasks(AUDIT_URL, siteResults, ASANA_TOKEN);
+      }
+    }
   } catch (err) {
     console.error('Error ejecutando auditoría:', err.message);
     process.exit(1);

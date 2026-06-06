@@ -62,11 +62,14 @@ const projectSlidesPath = path.join(projectPath, CONTRAST_SLIDES_FILE_NAME);
 
 const forwardedAuditArgs = process.argv.slice(2).filter((arg, index, originalArgs) => {
   const previousArg = index > 0 ? originalArgs[index - 1] : '';
-  const isManagedValue = previousArg === '--project'
-    || previousArg === '-p'
-    || previousArg === '--report'
-    || previousArg === '-r'
-    || previousArg === '--output-dir';
+  const isManagedValue = (
+    (previousArg === '--project'
+      || previousArg === '-p'
+      || previousArg === '--report'
+      || previousArg === '-r'
+      || previousArg === '--output-dir')
+    && !arg.startsWith('-')
+  );
   const isManagedInline = arg.startsWith('--project=')
     || arg.startsWith('--report=')
     || arg.startsWith('--output-dir=');
