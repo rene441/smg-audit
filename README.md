@@ -187,6 +187,8 @@ smg-accessibility-audit-and-repair --url "https://tutienda.myshopify.com" --proj
 
 Ejecuta la auditoría y aplica autofix sobre el proyecto. Si corres el comando desde la raíz del theme, `--project` usa ese directorio.
 
+Con `--site`, aplica autofix usando todos los `accesibilidad_report.txt` generados (raíz + subcarpetas por página).
+
 Reglas con autofix disponible:
 - `image-alt`
 - `link-name` (casos seguros)

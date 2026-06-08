@@ -101,6 +101,47 @@ function runNodeScript(scriptPath, args, label) {
   }
 }
 
+function collectReportPaths(rootDir) {
+  if (!fs.existsSync(rootDir)) {
+    return [];
+  }
+
+  const collected = [];
+
+  const walk = (currentPath) => {
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+
+      if (entry.isDirectory()) {
+        walk(fullPath);
+        continue;
+      }
+
+      if (entry.isFile() && entry.name === 'accesibilidad_report.txt') {
+        collected.push(fullPath);
+      }
+    }
+  };
+
+  walk(rootDir);
+
+  // Root report first, then nested pages for deterministic output.
+  collected.sort((left, right) => {
+    const leftDepth = left.split(path.sep).length;
+    const rightDepth = right.split(path.sep).length;
+
+    if (leftDepth !== rightDepth) {
+      return leftDepth - rightDepth;
+    }
+
+    return left.localeCompare(right);
+  });
+
+  return collected;
+}
+
 function persistContrastSlides() {
   if (!fs.existsSync(contrastSlidesPath)) {
     return false;
@@ -120,7 +161,18 @@ function cleanupTemporaryOutputDir() {
 
 try {
   runNodeScript(auditScriptPath, [...forwardedAuditArgs, '--output-dir', outputDir], 'auditoria');
-  runNodeScript(repairScriptPath, ['--project', projectPath, '--report', reportPath], 'reparacion');
+  const reportPaths = argv.report
+    ? [reportPath]
+    : collectReportPaths(outputDir);
+
+  if (reportPaths.length === 0) {
+    throw new Error(`No se encontro ningun accesibilidad_report.txt en ${outputDir}`);
+  }
+
+  for (const currentReportPath of reportPaths) {
+    console.log(`[REPAIR] Procesando reporte: ${currentReportPath}`);
+    runNodeScript(repairScriptPath, ['--project', projectPath, '--report', currentReportPath], 'reparacion');
+  }
 
   const slidesWerePersisted = !usingExplicitOutputDir && persistContrastSlides();
 
@@ -128,7 +180,11 @@ try {
   console.log('  Auditoria + Reparacion completadas');
   console.log('========================');
   console.log(`Proyecto reparado: ${projectPath}`);
-  console.log(`Reporte usado: ${reportPath}`);
+  if (reportPaths.length === 1) {
+    console.log(`Reporte usado: ${reportPaths[0]}`);
+  } else {
+    console.log(`Reportes usados: ${reportPaths.length}`);
+  }
   if (slidesWerePersisted) {
     console.log(`Slides contraste: ${projectSlidesPath}`);
   }
